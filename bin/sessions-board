@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""
+sessions-board: coordination board for parallel Claude Code sessions.
+
+Lets multiple Claude Code sessions running in the same project directory
+see each other, declare what they are working on, lock files, and exchange
+short messages -- all through a small filesystem-based protocol.
+
+Storage layout (per project):
+  ~/.claude/coordination/projects/<sha1(realpath(cwd))>/
+    _meta.json                          project metadata
+    sessions/<session_id>.json          per-session heartbeat
+    locks/<sha1(abs_path)>.json         per-file lock
+    inbox/<session_id>/new/<id>.json    incoming messages (unread)
+    inbox/<session_id>/processed/<id>   read messages (rename in/out)
+    _last_gc                            timestamp of last GC
+
+Design notes:
+  - Atomic writes via tmpfile-in-same-dir + os.replace().
+  - Stale detection: pid alive AND pid_start_token matches AND not expired.
+  - Lazy GC: heartbeat command sweeps stale state if last GC > 5min ago.
+  - Locks do NOT block: PreToolUse hooks deny + return reason instead.
+  - SessionEnd hook is best-effort cleanup; TTL/GC is the source of truth.
+
+See https://github.com/grinzing/claude-sessions-board for details.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+__version__ = "0.1.0"
+
+# ---- constants ----
+ROOT = Path.home() / ".claude" / "coordination" / "projects"
+SESSION_TTL = timedelta(minutes=30)
+LOCK_TTL = timedelta(minutes=10)
+GC_INTERVAL = timedelta(minutes=5)
+
+
+# ---- utilities ----
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+def parse_iso(s: str) -> datetime:
+    return datetime.fromisoformat(s)
+
+
+def sha1_short(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+
+
+def atomic_write_json(path: Path, data: dict) -> None:
+    """Write JSON atomically: write to tmp in same dir, fsync, rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def read_json(path: Path) -> dict | None:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # foreign-uid process is still alive
+
+
+def pid_start_token(pid: int) -> str | None:
+    """Return a stable string identifying this PID's start time.
+
+    Used together with pid liveness to defeat PID reuse: if a PID is
+    recycled by the OS, the start time will differ and we treat the
+    old session as dead.
+    """
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        return out or None
+    except Exception:
+        return None
+
+
+# ---- project resolution ----
+
+def project_dir(cwd: str) -> Path:
+    """Resolve a project directory to its coordination dir, creating it on demand."""
+    real = os.path.realpath(cwd)
+    h = sha1_short(real)
+    d = ROOT / h
+    if not d.exists():
+        d.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(d / "_meta.json", {"cwd": real, "created_at": iso(now())})
+    (d / "sessions").mkdir(exist_ok=True)
+    (d / "locks").mkdir(exist_ok=True)
+    (d / "inbox").mkdir(exist_ok=True)
+    return d
+
+
+def ppid_pointer_path(pdir: Path) -> Path:
+    """File that maps the calling shell's PPID to its session_id.
+
+    The CLI is typically invoked from a hook script whose parent is the
+    Claude Code process. We persist that mapping so subsequent CLI calls
+    from the same session don't need to pass --session-id explicitly.
+    """
+    return pdir / f"_session_by_ppid_{os.getppid()}"
+
+
+def write_ppid_pointer(pdir: Path, sid: str) -> None:
+    try:
+        ppid_pointer_path(pdir).write_text(sid)
+    except OSError:
+        pass
+
+
+def read_ppid_pointer(pdir: Path) -> str | None:
+    try:
+        return ppid_pointer_path(pdir).read_text().strip() or None
+    except OSError:
+        return None
+
+
+def resolve_session_id(args, pdir: Path) -> str | None:
+    """Resolve session_id from --session-id, $CLAUDE_SESSION_ID, or PPID pointer."""
+    sid = getattr(args, "session_id", None)
+    if sid:
+        write_ppid_pointer(pdir, sid)
+        return sid
+    sid = os.environ.get("CLAUDE_SESSION_ID")
+    if sid:
+        write_ppid_pointer(pdir, sid)
+        return sid
+    return read_ppid_pointer(pdir)
+
+
+# ---- session state ----
+
+def session_file(pdir: Path, sid: str) -> Path:
+    return pdir / "sessions" / f"{sid}.json"
+
+
+def is_session_alive(s: dict) -> bool:
+    pid = s.get("pid")
+    if not pid or not pid_alive(pid):
+        return False
+    try:
+        if parse_iso(s["expires_at"]) < now():
+            return False
+    except Exception:
+        return False
+    # PID reuse defense
+    expected = s.get("pid_start_token")
+    if expected:
+        cur = pid_start_token(pid)
+        if cur is not None and cur != expected:
+            return False
+    return True
+
+
+# ---- commands ----
+
+def cmd_register(args) -> None:
+    pdir = project_dir(args.cwd)
+    sid = args.session_id or os.environ.get("CLAUDE_SESSION_ID")
+    if not sid:
+        print("error: --session-id or $CLAUDE_SESSION_ID is required", file=sys.stderr)
+        sys.exit(1)
+    write_ppid_pointer(pdir, sid)
+    pid = int(args.pid or os.getppid())
+    data = {
+        "session_id": sid,
+        "pid": pid,
+        "pid_start_token": pid_start_token(pid),
+        "cwd": os.path.realpath(args.cwd),
+        "branch": args.branch or "",
+        "summary": "",
+        "started_at": iso(now()),
+        "expires_at": iso(now() + SESSION_TTL),
+    }
+    existing = read_json(session_file(pdir, sid))
+    if existing and existing.get("summary"):
+        data["summary"] = existing["summary"]
+    atomic_write_json(session_file(pdir, sid), data)
+    (pdir / "inbox" / sid / "new").mkdir(parents=True, exist_ok=True)
+    (pdir / "inbox" / sid / "processed").mkdir(parents=True, exist_ok=True)
+    maybe_gc(pdir)
+    print(f"registered: {sid}")
+
+
+def cmd_unregister(args) -> None:
+    pdir = project_dir(args.cwd)
+    sid = resolve_session_id(args, pdir)
+    if not sid:
+        return
+    for lf in (pdir / "locks").glob("*.json"):
+        d = read_json(lf)
+        if d and d.get("session_id") == sid:
+            lf.unlink(missing_ok=True)
+    session_file(pdir, sid).unlink(missing_ok=True)
+    ppid_pointer_path(pdir).unlink(missing_ok=True)
+    print(f"unregistered: {sid}")
+
+
+def cmd_heartbeat(args) -> None:
+    pdir = project_dir(args.cwd)
+    sid = resolve_session_id(args, pdir)
+    if not sid:
+        return
+    sf = session_file(pdir, sid)
+    d = read_json(sf)
+    if not d:
+        return
+    d["expires_at"] = iso(now() + SESSION_TTL)
+    atomic_write_json(sf, d)
+    maybe_gc(pdir)
+
+
+def cmd_summary(args) -> None:
+    pdir = project_dir(args.cwd)
+    sid = resolve_session_id(args, pdir)
+    if not sid:
+        print("error: no session_id (run from a hook or pass --session-id)", file=sys.stderr)
+        sys.exit(1)
+    sf = session_file(pdir, sid)
+    d = read_json(sf)
+    if not d:
+        print("error: session not registered (SessionStart hook may not have run)", file=sys.stderr)
+        sys.exit(1)
+    d["summary"] = args.text
+    d["expires_at"] = iso(now() + SESSION_TTL)
+    atomic_write_json(sf, d)
+    print(f"summary updated: {args.text}")
+
+
+def cmd_list(args) -> None:
+    pdir = project_dir(args.cwd)
+    me = resolve_session_id(args, pdir)
+    items = []
+    for sf in sorted((pdir / "sessions").glob("*.json")):
+        d = read_json(sf)
+        if not d or not is_session_alive(d):
+            continue
+        items.append(d)
+    if not items:
+        print("(no active sessions)")
+        return
+    print(f"== Active sessions in {os.path.realpath(args.cwd)} ==")
+    for d in items:
+        marker = " (you)" if d["session_id"] == me else ""
+        print(f"- {d['session_id'][:12]}{marker}  branch={d.get('branch') or '-'}  pid={d['pid']}")
+        if d.get("summary"):
+            print(f"    summary: {d['summary']}")
+
+
+def cmd_send(args) -> None:
+    pdir = project_dir(args.cwd)
+    me = resolve_session_id(args, pdir) or "unknown"
+    target = args.to
+    inbox = pdir / "inbox" / target / "new"
+    inbox.mkdir(parents=True, exist_ok=True)
+    msg_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    data = {
+        "id": msg_id,
+        "from": me,
+        "to": target,
+        "sent_at": iso(now()),
+        "text": args.text,
+    }
+    atomic_write_json(inbox / f"{msg_id}.json", data)
+    print(f"sent to {target[:12]}: {args.text}")
+
+
+def cmd_inbox(args) -> None:
+    pdir = project_dir(args.cwd)
+    sid = resolve_session_id(args, pdir)
+    if not sid:
+        return
+    new_dir = pdir / "inbox" / sid / "new"
+    proc_dir = pdir / "inbox" / sid / "processed"
+    new_dir.mkdir(parents=True, exist_ok=True)
+    proc_dir.mkdir(parents=True, exist_ok=True)
+    msgs = sorted(new_dir.glob("*.json"))
+    if not msgs:
+        if not args.quiet:
+            print("(no new messages)")
+        return
+    print(f"== Inbox ({len(msgs)} new) ==")
+    for mf in msgs:
+        d = read_json(mf)
+        if not d:
+            continue
+        print(f"[{d['sent_at']}] from {d['from'][:12]}: {d['text']}")
+        if not args.peek:
+            try:
+                os.replace(mf, proc_dir / mf.name)
+            except OSError:
+                pass
+
+
+def cmd_lock(args) -> None:
+    pdir = project_dir(args.cwd)
+    sid = resolve_session_id(args, pdir)
+    if not sid:
+        print("error: no session_id (run from a hook or pass --session-id)", file=sys.stderr)
+        sys.exit(1)
+    apath = os.path.realpath(args.path)
+    lf = pdir / "locks" / f"{sha1_short(apath)}.json"
+    existing = read_json(lf)
+    if existing and not is_lock_stale(pdir, existing):
+        if existing["session_id"] != sid:
+            print(
+                f"error: locked by {existing['session_id'][:12]} (mode={existing['mode']})",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+    data = {
+        "session_id": sid,
+        "path": apath,
+        "mode": args.mode,
+        "acquired_at": iso(now()),
+        "expires_at": iso(now() + LOCK_TTL),
+    }
+    atomic_write_json(lf, data)
+    print(f"locked: {apath}")
+
+
+def cmd_unlock(args) -> None:
+    pdir = project_dir(args.cwd)
+    sid = resolve_session_id(args, pdir)
+    apath = os.path.realpath(args.path)
+    lf = pdir / "locks" / f"{sha1_short(apath)}.json"
+    d = read_json(lf)
+    if not d:
+        return
+    if d["session_id"] != sid:
+        print("error: not your lock", file=sys.stderr)
+        sys.exit(1)
+    lf.unlink(missing_ok=True)
+    print(f"unlocked: {apath}")
+
+
+def is_lock_stale(pdir: Path, lock: dict) -> bool:
+    try:
+        if parse_iso(lock["expires_at"]) < now():
+            return True
+    except Exception:
+        return True
+    holder = read_json(session_file(pdir, lock["session_id"]))
+    if not holder or not is_session_alive(holder):
+        return True
+    return False
+
+
+def cmd_check_lock(args) -> None:
+    """Used by PreToolUse hook before Edit/Write. Exits 2 with reason if denied."""
+    pdir = project_dir(args.cwd)
+    sid = resolve_session_id(args, pdir)
+    apath = os.path.realpath(args.path)
+    lf = pdir / "locks" / f"{sha1_short(apath)}.json"
+    d = read_json(lf)
+    if not d or is_lock_stale(pdir, d):
+        sys.exit(0)
+    if d["session_id"] == sid:
+        sys.exit(0)
+    holder = d["session_id"]
+    msg = (
+        f"This file is locked by another Claude Code session "
+        f"(session_id={holder[:12]}, mode={d['mode']}, expires_at={d['expires_at']}). "
+        f"Coordinate with the lock holder before editing: "
+        f"`sessions-board send {holder} \"<your message>\"`. "
+        f"If the holder is unreachable, you may wait for the lock to expire."
+    )
+    print(msg, file=sys.stderr)
+    sys.exit(2)
+
+
+# ---- GC ----
+
+def maybe_gc(pdir: Path) -> None:
+    marker = pdir / "_last_gc"
+    try:
+        last = float(marker.read_text())
+    except (OSError, ValueError):
+        last = 0.0
+    if time.time() - last < GC_INTERVAL.total_seconds():
+        return
+    try:
+        marker.write_text(str(time.time()))
+    except OSError:
+        pass
+    run_gc(pdir)
+
+
+def run_gc(pdir: Path) -> None:
+    for sf in (pdir / "sessions").glob("*.json"):
+        d = read_json(sf)
+        if not d or not is_session_alive(d):
+            sf.unlink(missing_ok=True)
+            sid = sf.stem
+            ibox = pdir / "inbox" / sid
+            if ibox.exists():
+                for f in ibox.rglob("*"):
+                    if f.is_file():
+                        f.unlink(missing_ok=True)
+    for lf in (pdir / "locks").glob("*.json"):
+        d = read_json(lf)
+        if not d or is_lock_stale(pdir, d):
+            lf.unlink(missing_ok=True)
+    for p in pdir.glob("_session_by_ppid_*"):
+        try:
+            ppid = int(p.name.rsplit("_", 1)[-1])
+            if not pid_alive(ppid):
+                p.unlink(missing_ok=True)
+        except (ValueError, OSError):
+            pass
+
+
+def cmd_gc(args) -> None:
+    pdir = project_dir(args.cwd)
+    run_gc(pdir)
+    print("gc done")
+
+
+# ---- main ----
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="sessions-board",
+        description="Coordination board for parallel Claude Code sessions.",
+        epilog="See https://github.com/grinzing/claude-sessions-board for full docs.",
+    )
+    p.add_argument("--version", action="version", version=f"sessions-board {__version__}")
+    p.add_argument(
+        "--cwd",
+        default=os.getcwd(),
+        help="project working directory (default: current dir). "
+             "All sessions in the same realpath share one board.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="<command>")
+
+    sp = sub.add_parser("register", help="register the current session (called by SessionStart hook)")
+    sp.add_argument("--session-id", required=False)
+    sp.add_argument("--pid", type=int, help="explicit PID to record (default: PPID)")
+    sp.add_argument("--branch", default="")
+    sp.set_defaults(func=cmd_register)
+
+    sp = sub.add_parser("unregister", help="remove the current session (called by SessionEnd hook)")
+    sp.add_argument("--session-id")
+    sp.set_defaults(func=cmd_unregister)
+
+    sp = sub.add_parser("heartbeat", help="extend session TTL (called by UserPromptSubmit hook)")
+    sp.add_argument("--session-id")
+    sp.set_defaults(func=cmd_heartbeat)
+
+    sp = sub.add_parser("summary", help="declare what this session is currently working on")
+    sp.add_argument("text", help='one-line summary, e.g. "implementing auth middleware"')
+    sp.add_argument("--session-id")
+    sp.set_defaults(func=cmd_summary)
+
+    sp = sub.add_parser("list", help="list active sessions in the same project")
+    sp.add_argument("--session-id")
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("send", help="send a short message to another session")
+    sp.add_argument("to", help="target session_id")
+    sp.add_argument("text", help="message body")
+    sp.add_argument("--session-id")
+    sp.set_defaults(func=cmd_send)
+
+    sp = sub.add_parser("inbox", help="read messages addressed to this session")
+    sp.add_argument("--session-id")
+    sp.add_argument("--peek", action="store_true", help="don't mark messages as read")
+    sp.add_argument("--quiet", action="store_true", help="say nothing if empty")
+    sp.set_defaults(func=cmd_inbox)
+
+    sp = sub.add_parser("lock", help="acquire a file lock visible to other sessions")
+    sp.add_argument("path")
+    sp.add_argument("--mode", choices=["read", "write"], default="write")
+    sp.add_argument("--session-id")
+    sp.set_defaults(func=cmd_lock)
+
+    sp = sub.add_parser("unlock", help="release a previously acquired lock")
+    sp.add_argument("path")
+    sp.add_argument("--session-id")
+    sp.set_defaults(func=cmd_unlock)
+
+    sp = sub.add_parser("check-lock", help="(internal) used by PreToolUse hook")
+    sp.add_argument("path")
+    sp.add_argument("--session-id")
+    sp.set_defaults(func=cmd_check_lock)
+
+    sp = sub.add_parser("gc", help="manually sweep stale sessions/locks/messages")
+    sp.set_defaults(func=cmd_gc)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
